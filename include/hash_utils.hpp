@@ -24,8 +24,8 @@ inline uint64_t hash2(uint64_t key, uint64_t table_size) {
 
 inline size_t practical_block_size(size_t n, double alpha) {
     if (alpha >= 1.0) return 2;
-    double log_n = std::log(static_cast<double>(std::max(n, size_t(4))));
-    double loglog = std::log(log_n) / std::log(2.0);
+    double log_n  = std::log2(std::max((double)n, 4.0));
+    double loglog = std::log2(std::max(log_n, 1.0));
     double scaled = (1.0 / (1.0 - alpha)) * loglog;
     return std::max(size_t(2), static_cast<size_t>(std::ceil(scaled)));
 }
