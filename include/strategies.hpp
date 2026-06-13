@@ -13,6 +13,10 @@ namespace hp
 
   constexpr uint64_t kEmptyKey = std::numeric_limits<uint64_t>::max();
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  LinearProbingTable  —  baseline
+  // ═══════════════════════════════════════════════════════════════════════════
+
   class LinearProbingTable : public HashTableStrategy
   {
   public:
@@ -82,17 +86,13 @@ namespace hp
 
     void reset_metrics() override { metrics_.reset_runtime(); }
     const TableMetrics &metrics() const override { return metrics_; }
-
     void refresh_cluster_metric() override
     {
       metrics_.max_cluster = compute_max_cluster(table_.data(), capacity_, kEmptyKey);
     }
 
     std::string name() const override { return "LinearProbing"; }
-    std::string description() const override
-    {
-      return "Sondagem linear classica (baseline).";
-    }
+    std::string description() const override { return "Sondagem linear classica (baseline)."; }
 
   private:
     std::vector<uint64_t> table_;
@@ -100,6 +100,10 @@ namespace hp
     size_t size_ = 0;
     mutable TableMetrics metrics_;
   };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  LocallyLinearTable  —  LOCALLYLINEAR (Dalal et al. 2023)
+  // ═══════════════════════════════════════════════════════════════════════════
 
   class LocallyLinearTable : public HashTableStrategy
   {
@@ -118,7 +122,6 @@ namespace hp
     {
       if (key == kEmptyKey)
         return false;
-
       size_t h1 = static_cast<size_t>(hash1(key, capacity_));
       size_t h2 = static_cast<size_t>(hash2(key, capacity_));
       size_t b1 = block_index(h1, block_size_);
@@ -126,13 +129,9 @@ namespace hp
 
       size_t chosen_block = b1;
       if (block_loads_[b1] > block_loads_[b2])
-      {
         chosen_block = b2;
-      }
       else if (block_loads_[b1] == block_loads_[b2] && b1 != b2 && coin_flip(rng_))
-      {
         chosen_block = b2;
-      }
 
       size_t start_cell = (chosen_block == b1) ? h1 : h2;
       uint64_t probes = 0;
@@ -159,7 +158,6 @@ namespace hp
         const_cast<LocallyLinearTable *>(this)->metrics_.search_success_stats.record(probes);
         return true;
       }
-
       SearchOutcome o2 = SearchOutcome::BlockFull;
       if (h2 != h1)
       {
@@ -170,13 +168,11 @@ namespace hp
           return true;
         }
       }
-
       if (o1 == SearchOutcome::EmptyGap || o2 == SearchOutcome::EmptyGap)
       {
         const_cast<LocallyLinearTable *>(this)->metrics_.search_fail_stats.record(probes);
         return false;
       }
-
       size_t b1 = block_index(h1, block_size_);
       size_t b2 = block_index(h2, block_size_);
       size_t block_count = num_blocks(capacity_, block_size_);
@@ -198,7 +194,6 @@ namespace hp
           }
         }
       }
-
       const_cast<LocallyLinearTable *>(this)->metrics_.search_fail_stats.record(probes);
       return false;
     }
@@ -221,7 +216,6 @@ namespace hp
 
     void reset_metrics() override { metrics_.reset_runtime(); }
     const TableMetrics &metrics() const override { return metrics_; }
-
     void refresh_cluster_metric() override
     {
       metrics_.max_cluster = compute_max_cluster(table_.data(), capacity_, kEmptyKey);
@@ -241,22 +235,18 @@ namespace hp
       BlockFull
     };
 
-    size_t insert_in_block(size_t start_cell, uint64_t key, uint64_t &probes)
+    size_t insert_in_block(size_t start_cell, uint64_t /*key*/, uint64_t &probes)
     {
-      (void)key;
       size_t bid = block_index(start_cell, block_size_);
       size_t block_count = num_blocks(capacity_, block_size_);
-
       for (size_t round = 0; round < block_count; ++round)
       {
-        size_t current_block = (bid + round) % block_count;
-        size_t cells = cells_in_block(current_block, block_size_, capacity_);
-        if (block_loads_[current_block] >= cells)
+        size_t cb = (bid + round) % block_count;
+        size_t cells = cells_in_block(cb, block_size_, capacity_);
+        if (block_loads_[cb] >= cells)
           continue;
-
-        size_t block_begin = block_start(current_block, block_size_);
+        size_t block_begin = block_start(cb, block_size_);
         size_t offset = (round == 0) ? (start_cell - block_begin) : 0;
-
         for (size_t i = 0; i < cells; ++i)
         {
           size_t pos = block_begin + ((offset + i) % cells);
@@ -275,7 +265,6 @@ namespace hp
       size_t block_begin = block_start(bid, block_size_);
       size_t offset = start_cell - block_begin;
       bool saw_empty = false;
-
       for (size_t i = 0; i < cells; ++i)
       {
         size_t pos = block_begin + ((offset + i) % cells);
@@ -288,7 +277,6 @@ namespace hp
         if (table_[pos] == key)
           return SearchOutcome::Found;
       }
-
       if (saw_empty)
         return SearchOutcome::EmptyGap;
       if (block_loads_[bid] < cells)
@@ -302,13 +290,16 @@ namespace hp
     }
 
     std::vector<uint64_t> table_;
-    size_t capacity_;
-    size_t block_size_;
+    size_t capacity_, block_size_;
     std::vector<size_t> block_loads_;
     size_t size_ = 0;
     mutable TableMetrics metrics_;
-    std::mt19937_64 rng_;
+    mutable std::mt19937_64 rng_;
   };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  WalkFirstTable  —  WALKFIRST (Dalal et al. 2023)
+  // ═══════════════════════════════════════════════════════════════════════════
 
   class WalkFirstTable : public HashTableStrategy
   {
@@ -327,31 +318,22 @@ namespace hp
     {
       if (key == kEmptyKey)
         return false;
-
       size_t h1 = static_cast<size_t>(hash1(key, capacity_));
       size_t h2 = static_cast<size_t>(hash2(key, capacity_));
-
-      uint64_t probes1 = 0;
-      uint64_t probes2 = 0;
-      size_t u = terminal_empty(h1, probes1);
-      size_t v = terminal_empty(h2, probes2);
-
+      uint64_t p1 = 0, p2 = 0;
+      size_t u = terminal_empty(h1, p1);
+      size_t v = terminal_empty(h2, p2);
       size_t bu = block_index(u, block_size_);
       size_t bv = block_index(v, block_size_);
       size_t chosen = u;
       if (block_loads_[bu] > block_loads_[bv])
-      {
         chosen = v;
-      }
       else if (block_loads_[bu] == block_loads_[bv] && u != v && coin_flip(rng_))
-      {
         chosen = v;
-      }
-
       table_[chosen] = key;
       ++size_;
       ++block_loads_[block_index(chosen, block_size_)];
-      metrics_.insert_stats.record(probes1 + probes2);
+      metrics_.insert_stats.record(p1 + p2);
       return true;
     }
 
@@ -368,6 +350,7 @@ namespace hp
           ++probes;
           if (table_[idx1] == key)
           {
+            const_cast<WalkFirstTable *>(this)->metrics_.search_success_stats.record(probes);
             return true;
           }
           if (table_[idx1] == kEmptyKey)
@@ -380,6 +363,7 @@ namespace hp
           ++probes;
           if (table_[idx2] == key)
           {
+            const_cast<WalkFirstTable *>(this)->metrics_.search_success_stats.record(probes);
             return true;
           }
           if (table_[idx2] == kEmptyKey)
@@ -388,6 +372,7 @@ namespace hp
             idx2 = (idx2 + 1) % capacity_;
         }
       }
+      const_cast<WalkFirstTable *>(this)->metrics_.search_fail_stats.record(probes);
       return false;
     }
 
@@ -409,7 +394,6 @@ namespace hp
 
     void reset_metrics() override { metrics_.reset_runtime(); }
     const TableMetrics &metrics() const override { return metrics_; }
-
     void refresh_cluster_metric() override
     {
       metrics_.max_cluster = compute_max_cluster(table_.data(), capacity_, kEmptyKey);
@@ -435,23 +419,33 @@ namespace hp
     }
 
     std::vector<uint64_t> table_;
-    size_t capacity_;
-    size_t block_size_;
+    size_t capacity_, block_size_;
     std::vector<size_t> block_loads_;
     size_t size_ = 0;
     mutable TableMetrics metrics_;
-    std::mt19937_64 rng_;
+    mutable std::mt19937_64 rng_;
   };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  AdaptiveLocalTable  —  CAAP (Cluster-Aware Adaptive Probing)
+  //
+  //  FIX (v2): search now uses dual-path (h1 + h2) to avoid false negatives
+  //  when a key was placed by the two-way path and is unreachable from h1
+  //  alone.  block_fill_limit is now a constructor parameter (default 0.85).
+  // ═══════════════════════════════════════════════════════════════════════════
 
   class AdaptiveLocalTable : public HashTableStrategy
   {
   public:
-    AdaptiveLocalTable(size_t capacity, double target_alpha, size_t cluster_threshold)
+    AdaptiveLocalTable(size_t capacity, double target_alpha,
+                       size_t cluster_threshold,
+                       double block_fill_limit = 0.85)
         : table_(capacity, kEmptyKey),
           capacity_(capacity),
           block_size_(practical_block_size(capacity, target_alpha)),
           block_loads_(num_blocks(capacity, block_size_), 0),
           cluster_threshold_(cluster_threshold),
+          block_fill_limit_(block_fill_limit),
           rng_(0xBADB001ULL)
     {
       metrics_.auxiliary_memory_bytes = block_loads_.size() * sizeof(size_t);
@@ -466,34 +460,63 @@ namespace hp
       size_t local_cluster = measure_forward_cluster(h1);
       size_t bid = block_index(h1, block_size_);
       size_t cells = cells_in_block(bid, block_size_, capacity_);
-      double block_fill = cells == 0 ? 1.0 : static_cast<double>(block_loads_[bid]) / static_cast<double>(cells);
+      double bf = cells == 0
+                      ? 1.0
+                      : static_cast<double>(block_loads_[bid]) / static_cast<double>(cells);
 
-      if (local_cluster < cluster_threshold_ && block_fill < 0.85)
-      {
+      // Use cheap linear probing while the neighbourhood is uncrowded,
+      // switch to WalkFirst-style two-way probing when a cluster forms.
+      if (local_cluster < cluster_threshold_ && bf < block_fill_limit_)
         return insert_linear(h1, key);
-      }
       return insert_two_way(key);
     }
 
+    // ── Dual-path search (v2 correctness fix) ─────────────────────────────
+    // A key may reside anywhere reachable from h1(k) OR h2(k) by linear
+    // probing.  We walk both chains in lock-step until the key is found or
+    // both chains terminate at an empty cell.
     bool search(uint64_t key) const override
     {
       uint64_t probes = 0;
-      size_t idx = static_cast<size_t>(hash1(key, capacity_));
-      while (true)
+      size_t idx1 = static_cast<size_t>(hash1(key, capacity_));
+      size_t idx2 = static_cast<size_t>(hash2(key, capacity_));
+      bool a1 = true;
+      bool a2 = (idx1 != idx2); // skip duplicate start
+
+      while (a1 || a2)
       {
-        ++probes;
-        if (table_[idx] == kEmptyKey)
+        if (a1)
         {
-          const_cast<AdaptiveLocalTable *>(this)->metrics_.search_fail_stats.record(probes);
-          return false;
+          ++probes;
+          if (table_[idx1] == key)
+          {
+            const_cast<AdaptiveLocalTable *>(this)
+                ->metrics_.search_success_stats.record(probes);
+            return true;
+          }
+          if (table_[idx1] == kEmptyKey)
+            a1 = false;
+          else
+            idx1 = (idx1 + 1) % capacity_;
         }
-        if (table_[idx] == key)
+        if (a2)
         {
-          const_cast<AdaptiveLocalTable *>(this)->metrics_.search_success_stats.record(probes);
-          return true;
+          ++probes;
+          if (table_[idx2] == key)
+          {
+            const_cast<AdaptiveLocalTable *>(this)
+                ->metrics_.search_success_stats.record(probes);
+            return true;
+          }
+          if (table_[idx2] == kEmptyKey)
+            a2 = false;
+          else
+            idx2 = (idx2 + 1) % capacity_;
         }
-        idx = (idx + 1) % capacity_;
       }
+      const_cast<AdaptiveLocalTable *>(this)
+          ->metrics_.search_fail_stats.record(probes);
+      return false;
     }
 
     void clear() override
@@ -514,7 +537,6 @@ namespace hp
 
     void reset_metrics() override { metrics_.reset_runtime(); }
     const TableMetrics &metrics() const override { return metrics_; }
-
     void refresh_cluster_metric() override
     {
       metrics_.max_cluster = compute_max_cluster(table_.data(), capacity_, kEmptyKey);
@@ -523,14 +545,15 @@ namespace hp
     std::string name() const override { return "AdaptiveLocal"; }
     std::string description() const override
     {
-      return "Heuristica adaptativa: LP classico em baixa ocupacao local; two-way ao detectar cluster.";
+      return "CAAP v2: LP classico em baixa ocupacao local; two-way ao detectar cluster (busca dual-path).";
     }
 
   private:
+    // ── helpers ──────────────────────────────────────────────────────────────
+
     size_t measure_forward_cluster(size_t start) const
     {
-      size_t count = 0;
-      size_t idx = start;
+      size_t count = 0, idx = start;
       while (table_[idx] != kEmptyKey)
       {
         ++count;
@@ -569,28 +592,20 @@ namespace hp
     {
       size_t h1 = static_cast<size_t>(hash1(key, capacity_));
       size_t h2 = static_cast<size_t>(hash2(key, capacity_));
-
-      uint64_t probes1 = 0;
-      uint64_t probes2 = 0;
-      size_t u = terminal_empty(h1, probes1);
-      size_t v = terminal_empty(h2, probes2);
-
+      uint64_t p1 = 0, p2 = 0;
+      size_t u = terminal_empty(h1, p1);
+      size_t v = terminal_empty(h2, p2);
       size_t bu = block_index(u, block_size_);
       size_t bv = block_index(v, block_size_);
       size_t chosen = u;
       if (block_loads_[bu] > block_loads_[bv])
-      {
         chosen = v;
-      }
       else if (block_loads_[bu] == block_loads_[bv] && u != v && coin_flip(rng_))
-      {
         chosen = v;
-      }
-
       table_[chosen] = key;
       ++size_;
       ++block_loads_[block_index(chosen, block_size_)];
-      metrics_.insert_stats.record(probes1 + probes2);
+      metrics_.insert_stats.record(p1 + p2);
       return true;
     }
 
@@ -607,43 +622,50 @@ namespace hp
     }
 
     std::vector<uint64_t> table_;
-    size_t capacity_;
-    size_t block_size_;
+    size_t capacity_, block_size_;
     std::vector<size_t> block_loads_;
     size_t cluster_threshold_;
+    double block_fill_limit_;
     size_t size_ = 0;
     mutable TableMetrics metrics_;
-    std::mt19937_64 rng_;
+    mutable std::mt19937_64 rng_;
   };
 
-  HashTablePtr make_linear_probing(size_t capacity)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  Factory functions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  inline HashTablePtr make_linear_probing(size_t capacity)
   {
     return HashTablePtr(new LinearProbingTable(capacity));
   }
 
-  HashTablePtr make_locally_linear(size_t capacity, double target_alpha)
+  inline HashTablePtr make_locally_linear(size_t capacity, double target_alpha)
   {
     return HashTablePtr(new LocallyLinearTable(capacity, target_alpha));
   }
 
-  HashTablePtr make_walkfirst(size_t capacity, double target_alpha)
+  inline HashTablePtr make_walkfirst(size_t capacity, double target_alpha)
   {
     return HashTablePtr(new WalkFirstTable(capacity, target_alpha));
   }
 
-  HashTablePtr make_adaptive_local(size_t capacity, double target_alpha, size_t cluster_threshold)
+  inline HashTablePtr make_adaptive_local(size_t capacity, double target_alpha,
+                                          size_t cluster_threshold,
+                                          double block_fill_limit)
   {
-    return HashTablePtr(new AdaptiveLocalTable(capacity, target_alpha, cluster_threshold));
+    return HashTablePtr(new AdaptiveLocalTable(capacity, target_alpha,
+                                               cluster_threshold, block_fill_limit));
   }
 
-  std::vector<HashTablePtr> all_strategies(size_t capacity, double target_alpha)
+  inline std::vector<HashTablePtr> all_strategies(size_t capacity, double target_alpha)
   {
-    std::vector<HashTablePtr> strategies;
-    strategies.push_back(make_linear_probing(capacity));
-    strategies.push_back(make_locally_linear(capacity, target_alpha));
-    strategies.push_back(make_walkfirst(capacity, target_alpha));
-    strategies.push_back(make_adaptive_local(capacity, target_alpha, 8));
-    return strategies;
+    std::vector<HashTablePtr> s;
+    s.push_back(make_linear_probing(capacity));
+    s.push_back(make_locally_linear(capacity, target_alpha));
+    s.push_back(make_walkfirst(capacity, target_alpha));
+    s.push_back(make_adaptive_local(capacity, target_alpha, 8, 0.85));
+    return s;
   }
 
 } // namespace hp

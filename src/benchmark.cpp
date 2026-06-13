@@ -1,34 +1,61 @@
+// benchmark.cpp  —  CAAP Benchmark Suite
+// Compile:  g++ -std=c++17 -O2 -Wall -Wextra -Iinclude src/benchmark.cpp -o build/benchmark
+// Quick run: ./build/benchmark --quick
+// Full run:  ./build/benchmark
+
 #include "hash_table.hpp"
 #include "strategies.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
-#include <sstream>
 #include <string>
 #include <vector>
 
 namespace
 {
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  Configuration
+  // ─────────────────────────────────────────────────────────────────────────────
+
   struct BenchConfig
   {
-    size_t table_size = 65536;
-    std::vector<double> load_factors = {0.20, 0.40, 0.60, 0.70, 0.80, 0.90, 0.95};
-    size_t repetitions = 50;
-    uint64_t seed = 42;
+    // ── Main sweep ────────────────────────────────────────────────────────────
+    std::vector<size_t> table_sizes = {4096, 16384, 65536, 262144, 1048576};
+    std::vector<double> load_factors = {
+        0.20, 0.30, 0.40, 0.50, 0.60,
+        0.70, 0.80, 0.85, 0.90, 0.95, 0.97, 0.98};
+    std::vector<uint64_t> seeds = {
+        42, 123, 456, 789, 2025,
+        31415, 65537, 99999, 777777, 888888};
+
+    // ── Parameter sweep (AdaptiveLocal only) ─────────────────────────────────
+    std::vector<size_t> ct_values = {2, 4, 6, 8, 10, 12, 16, 20, 24};
+    std::vector<double> bf_values = {0.70, 0.75, 0.80, 0.85, 0.90, 0.95};
+    size_t sweep_tsize = 65536;
+    std::vector<double> sweep_alphas = {0.60, 0.70, 0.80, 0.90, 0.95, 0.97};
+
     std::string output_dir = "results";
+    bool quick = false;
+    bool no_sweep = false;
   };
 
-  struct BenchRow
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  Row structures
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  struct MainRow
   {
     std::string strategy;
     double load_factor;
-    size_t repetition;
     size_t table_size;
+    uint64_t seed;
     size_t keys_inserted;
     double avg_insert_probes;
     double avg_search_success_probes;
@@ -41,32 +68,57 @@ namespace
     size_t aux_memory_bytes;
   };
 
+  struct ParamRow
+  {
+    size_t cluster_threshold;
+    double block_fill_limit;
+    double load_factor;
+    size_t table_size;
+    uint64_t seed;
+    size_t keys_inserted;
+    double avg_insert_probes;
+    double avg_search_success_probes;
+    double avg_search_fail_probes;
+    size_t max_cluster;
+    uint64_t worst_insert_probes;
+    double insert_ms;
+    size_t aux_memory_bytes;
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  Helpers
+  // ─────────────────────────────────────────────────────────────────────────────
+
   BenchConfig parse_args(int argc, char **argv)
   {
     BenchConfig cfg;
     for (int i = 1; i < argc; ++i)
     {
-      std::string arg = argv[i];
-      if (arg == "--table-size" && i + 1 < argc)
+      std::string a = argv[i];
+      if (a == "--quick")
       {
-        cfg.table_size = static_cast<size_t>(std::stoul(argv[++i]));
+        cfg.quick = true;
+        cfg.table_sizes = {8192};
+        cfg.seeds = {42, 123};
+        cfg.load_factors = {0.50, 0.70, 0.90, 0.95};
+        cfg.sweep_tsize = 8192;
+        cfg.sweep_alphas = {0.70, 0.90, 0.95};
       }
-      else if (arg == "--repetitions" && i + 1 < argc)
+      else if (a == "--no-sweep")
       {
-        cfg.repetitions = static_cast<size_t>(std::stoul(argv[++i]));
+        cfg.no_sweep = true;
       }
-      else if (arg == "--seed" && i + 1 < argc)
-      {
-        cfg.seed = static_cast<uint64_t>(std::stoull(argv[++i]));
-      }
-      else if (arg == "--output" && i + 1 < argc)
+      else if (a == "--output" && i + 1 < argc)
       {
         cfg.output_dir = argv[++i];
       }
-      else if (arg == "--quick")
+      else if (a == "--help")
       {
-        cfg.table_size = 8192;
-        cfg.repetitions = 5;
+        std::cout << "Usage: benchmark [options]\n"
+                     "  --quick          Fast mode (small table, 2 seeds)\n"
+                     "  --no-sweep       Skip parameter sweep\n"
+                     "  --output DIR     Output directory (default: results)\n";
+        std::exit(0);
       }
     }
     return cfg;
@@ -75,85 +127,75 @@ namespace
   std::vector<uint64_t> shuffled_keys(size_t count, std::mt19937_64 &rng)
   {
     std::vector<uint64_t> keys(count);
-    for (size_t i = 0; i < count; ++i)
-      keys[i] = i + 1;
+    std::iota(keys.begin(), keys.end(), uint64_t{1});
     std::shuffle(keys.begin(), keys.end(), rng);
     return keys;
   }
 
-  BenchRow run_single(hp::HashTableStrategy &table,
-                      const std::vector<uint64_t> &insert_keys,
-                      const std::vector<uint64_t> &search_present,
-                      const std::vector<uint64_t> &search_absent,
-                      double target_load,
-                      size_t repetition,
-                      size_t table_size)
+  /// Run one complete trial and return filled MainRow.
+  MainRow run_main_trial(hp::HashTableStrategy &table,
+                         const std::vector<uint64_t> &insert_keys,
+                         const std::vector<uint64_t> &absent_keys,
+                         double alpha, size_t tsize, uint64_t seed)
   {
     table.clear();
     table.reset_metrics();
 
-    const auto t0 = std::chrono::steady_clock::now();
-    for (uint64_t key : insert_keys)
-    {
-      table.insert(key);
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-
-    for (uint64_t key : search_present)
-    {
-      table.search(key);
-    }
-    for (uint64_t key : search_absent)
-    {
-      table.search(key);
-    }
-    const auto t2 = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
+    for (uint64_t k : insert_keys)
+      table.insert(k);
+    auto t1 = std::chrono::steady_clock::now();
+    // successful searches (all inserted keys)
+    for (uint64_t k : insert_keys)
+      table.search(k);
+    // failed searches (keys guaranteed absent)
+    for (uint64_t k : absent_keys)
+      table.search(k);
+    auto t2 = std::chrono::steady_clock::now();
 
     table.refresh_cluster_metric();
     const hp::TableMetrics &m = table.metrics();
 
-    const double insert_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    const double search_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    double ins_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double srch_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    uint64_t worst_s = std::max(m.search_success_stats.worst_probes,
+                                m.search_fail_stats.worst_probes);
 
-    uint64_t worst_search = m.search_success_stats.worst_probes;
-    if (m.search_fail_stats.worst_probes > worst_search)
-    {
-      worst_search = m.search_fail_stats.worst_probes;
-    }
-
-    BenchRow row;
-    row.strategy = table.name();
-    row.load_factor = target_load;
-    row.repetition = repetition;
-    row.table_size = table_size;
-    row.keys_inserted = insert_keys.size();
-    row.avg_insert_probes = m.insert_stats.average();
-    row.avg_search_success_probes = m.search_success_stats.average();
-    row.avg_search_fail_probes = m.search_fail_stats.average();
-    row.max_cluster = m.max_cluster;
-    row.worst_insert_probes = m.insert_stats.worst_probes;
-    row.worst_search_probes = worst_search;
-    row.insert_ms = insert_ms;
-    row.search_ms = search_ms;
-    row.aux_memory_bytes = m.auxiliary_memory_bytes;
-    return row;
+    return {
+        table.name(), alpha, tsize, seed,
+        insert_keys.size(),
+        m.insert_stats.average(),
+        m.search_success_stats.average(),
+        m.search_fail_stats.average(),
+        m.max_cluster,
+        m.insert_stats.worst_probes,
+        worst_s,
+        ins_ms, srch_ms,
+        m.auxiliary_memory_bytes};
   }
 
-  void write_csv(const std::string &path, const std::vector<BenchRow> &rows)
-  {
-    std::ofstream out(path.c_str());
-    out << "strategy,load_factor,repetition,table_size,keys_inserted,"
-        << "avg_insert_probes,avg_search_success_probes,avg_search_fail_probes,"
-        << "max_cluster,worst_insert_probes,worst_search_probes,"
-        << "insert_ms,search_ms,aux_memory_bytes\n";
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  CSV writers
+  // ─────────────────────────────────────────────────────────────────────────────
 
-    out << std::fixed << std::setprecision(6);
-    for (const BenchRow &r : rows)
+  void write_main_csv(const std::string &path, const std::vector<MainRow> &rows)
+  {
+    std::ofstream out(path);
+    if (!out)
     {
+      std::cerr << "Cannot open " << path << '\n';
+      return;
+    }
+    out << "strategy,load_factor,table_size,seed,"
+           "keys_inserted,avg_insert_probes,avg_search_success_probes,"
+           "avg_search_fail_probes,max_cluster,worst_insert_probes,"
+           "worst_search_probes,insert_ms,search_ms,aux_memory_bytes\n";
+    out << std::fixed << std::setprecision(6);
+    for (const auto &r : rows)
       out << r.strategy << ','
           << r.load_factor << ','
-          << r.repetition << ','
           << r.table_size << ','
+          << r.seed << ','
           << r.keys_inserted << ','
           << r.avg_insert_probes << ','
           << r.avg_search_success_probes << ','
@@ -164,98 +206,195 @@ namespace
           << r.insert_ms << ','
           << r.search_ms << ','
           << r.aux_memory_bytes << '\n';
-    }
   }
 
-  void print_summary(const std::vector<BenchRow> &rows)
+  void write_param_csv(const std::string &path, const std::vector<ParamRow> &rows)
   {
-    std::cout << "\nResumo (media por estrategia e fator de carga):\n";
-    std::cout << std::setw(16) << "estrategia"
-              << std::setw(8) << "alpha"
-              << std::setw(14) << "sond_ins"
-              << std::setw(14) << "cluster_max"
-              << std::setw(14) << "pior_ins"
-              << std::setw(12) << "t_ins_ms"
-              << '\n';
-
-    for (double alpha : {0.20, 0.40, 0.60, 0.70, 0.80, 0.90, 0.95})
+    std::ofstream out(path);
+    if (!out)
     {
-      for (const char *name : {"LinearProbing", "LocallyLinear", "WalkFirst", "AdaptiveLocal"})
-      {
-        double sum_ins = 0, sum_cluster = 0, sum_worst = 0, sum_time = 0;
-        size_t count = 0;
-        for (const BenchRow &r : rows)
-        {
-          if (r.strategy == name && std::abs(r.load_factor - alpha) < 1e-9)
-          {
-            sum_ins += r.avg_insert_probes;
-            sum_cluster += r.max_cluster;
-            sum_worst += r.worst_insert_probes;
-            sum_time += r.insert_ms;
-            ++count;
-          }
-        }
-        if (count == 0)
-          continue;
-        std::cout << std::setw(16) << name
-                  << std::setw(8) << alpha
-                  << std::setw(14) << (sum_ins / count)
-                  << std::setw(14) << (sum_cluster / count)
-                  << std::setw(14) << (sum_worst / count)
-                  << std::setw(12) << (sum_time / count)
-                  << '\n';
-      }
+      std::cerr << "Cannot open " << path << '\n';
+      return;
     }
+    out << "cluster_threshold,block_fill_limit,load_factor,table_size,seed,"
+           "keys_inserted,avg_insert_probes,avg_search_success_probes,"
+           "avg_search_fail_probes,max_cluster,worst_insert_probes,"
+           "insert_ms,aux_memory_bytes\n";
+    out << std::fixed << std::setprecision(6);
+    for (const auto &r : rows)
+      out << r.cluster_threshold << ','
+          << r.block_fill_limit << ','
+          << r.load_factor << ','
+          << r.table_size << ','
+          << r.seed << ','
+          << r.keys_inserted << ','
+          << r.avg_insert_probes << ','
+          << r.avg_search_success_probes << ','
+          << r.avg_search_fail_probes << ','
+          << r.max_cluster << ','
+          << r.worst_insert_probes << ','
+          << r.insert_ms << ','
+          << r.aux_memory_bytes << '\n';
   }
 
-} // namespace
+  // Simple inline progress bar
+  void progress(size_t done, size_t total, const std::string &tag)
+  {
+    int pct = static_cast<int>(100.0 * done / total);
+    constexpr int W = 30;
+    int fill = W * pct / 100;
+    std::cout << '\r' << tag << " [";
+    for (int i = 0; i < W; ++i)
+      std::cout << (i < fill ? '#' : ' ');
+    std::cout << "] " << std::setw(3) << pct << "% ("
+              << done << '/' << total << ')' << std::flush;
+    if (done == total)
+      std::cout << '\n';
+  }
+
+} // anonymous namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  main
+// ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv)
 {
   BenchConfig cfg = parse_args(argc, argv);
 
-  std::cout << "Hash Probing Study - IMD0029 UFRN\n";
-  std::cout << "table_size=" << cfg.table_size
-            << " repetitions=" << cfg.repetitions
-            << " seed=" << cfg.seed << '\n';
+  std::cout << "###########################################################\n"
+            << "#  CAAP Benchmark Suite - Cluster-Aware Adaptive Probing  #\n"
+            << "###########################################################\n";
+  if (cfg.quick)
+    std::cout << "[quick mode]\n";
 
 #ifdef _WIN32
-  std::string mkdir_cmd = "if not exist \"" + cfg.output_dir + "\" mkdir \"" + cfg.output_dir + "\"";
-  std::system(mkdir_cmd.c_str());
+  std::system(("if not exist \"" + cfg.output_dir + "\" mkdir \"" + cfg.output_dir + "\"").c_str());
 #else
   std::system(("mkdir -p " + cfg.output_dir).c_str());
 #endif
 
-  std::vector<BenchRow> all_rows;
-  std::mt19937_64 rng(cfg.seed);
+  // ─────────────────────────────────────────────────────────────────────────
+  //  Phase 1 – Main sweep
+  //  All 4 strategies × all table sizes × all load factors × all seeds
+  // ─────────────────────────────────────────────────────────────────────────
 
-  for (double alpha : cfg.load_factors)
+  std::vector<MainRow> main_rows;
   {
-    size_t key_count = static_cast<size_t>(alpha * static_cast<double>(cfg.table_size));
-    if (key_count == 0)
-      continue;
+    const size_t total =
+        4 * cfg.table_sizes.size() * cfg.load_factors.size() * cfg.seeds.size();
+    size_t done = 0;
 
-    std::cout << "Fator de carga " << alpha << " (" << key_count << " chaves)...\n";
+    std::cout << "\n[1/2] Main sweep - " << total << " trials\n";
 
-    for (size_t rep = 0; rep < cfg.repetitions; ++rep)
+    for (size_t tsize : cfg.table_sizes)
     {
-      std::vector<uint64_t> keys = shuffled_keys(key_count, rng);
-      std::vector<uint64_t> absent = shuffled_keys(key_count / 10 + 1, rng);
-      for (uint64_t &k : absent)
-        k += cfg.table_size + 1000;
-
-      auto strategies = hp::all_strategies(cfg.table_size, alpha);
-      for (auto &strategy : strategies)
+      for (double alpha : cfg.load_factors)
       {
-        BenchRow row = run_single(*strategy, keys, keys, absent, alpha, rep, cfg.table_size);
-        all_rows.push_back(row);
+        size_t n_keys = static_cast<size_t>(alpha * static_cast<double>(tsize));
+        if (n_keys == 0)
+          continue;
+
+        for (uint64_t seed : cfg.seeds)
+        {
+          std::mt19937_64 rng(seed);
+          auto ins_keys = shuffled_keys(n_keys, rng);
+
+          // Absent keys: values safely beyond table range
+          size_t n_absent = n_keys / 10 + 1;
+          auto abs_keys = shuffled_keys(n_absent, rng);
+          for (auto &k : abs_keys)
+            k += tsize + 100000ULL;
+
+          auto strategies = hp::all_strategies(tsize, alpha);
+          for (auto &s : strategies)
+          {
+            main_rows.push_back(
+                run_main_trial(*s, ins_keys, abs_keys, alpha, tsize, seed));
+            progress(++done, total, "  Phase 1");
+          }
+        }
       }
     }
   }
 
-  const std::string csv_path = cfg.output_dir + "/benchmark_raw.csv";
-  write_csv(csv_path, all_rows);
-  std::cout << "CSV salvo em: " << csv_path << '\n';
-  print_summary(all_rows);
+  const std::string main_csv = cfg.output_dir + "/benchmark_main.csv";
+  write_main_csv(main_csv, main_rows);
+  std::cout << "  Saved: " << main_csv << "  (" << main_rows.size() << " rows)\n";
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  Phase 2 – Parameter sweep
+  //  AdaptiveLocal only, grid over cluster_threshold × block_fill_limit
+  // ─────────────────────────────────────────────────────────────────────────
+
+  if (!cfg.no_sweep)
+  {
+    std::vector<ParamRow> param_rows;
+    const size_t total =
+        cfg.ct_values.size() * cfg.bf_values.size() * cfg.sweep_alphas.size() * cfg.seeds.size();
+    size_t done = 0;
+
+    std::cout << "\n[2/2] Parameter sweep - " << total
+              << " trials  (table_size=" << cfg.sweep_tsize << ")\n";
+
+    for (size_t ct : cfg.ct_values)
+    {
+      for (double bf : cfg.bf_values)
+      {
+        for (double alpha : cfg.sweep_alphas)
+        {
+          size_t n_keys = static_cast<size_t>(
+              alpha * static_cast<double>(cfg.sweep_tsize));
+          if (n_keys == 0)
+            continue;
+
+          for (uint64_t seed : cfg.seeds)
+          {
+            std::mt19937_64 rng(seed);
+            auto ins_keys = shuffled_keys(n_keys, rng);
+            size_t n_absent = n_keys / 10 + 1;
+            auto abs_keys = shuffled_keys(n_absent, rng);
+            for (auto &k : abs_keys)
+              k += cfg.sweep_tsize + 100000ULL;
+
+            auto table = hp::make_adaptive_local(
+                cfg.sweep_tsize, alpha, ct, bf);
+            table->clear();
+            table->reset_metrics();
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (uint64_t k : ins_keys)
+              table->insert(k);
+            auto t1 = std::chrono::steady_clock::now();
+            for (uint64_t k : ins_keys)
+              table->search(k);
+            for (uint64_t k : abs_keys)
+              table->search(k);
+
+            table->refresh_cluster_metric();
+            const hp::TableMetrics &m = table->metrics();
+            double ins_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            param_rows.push_back({ct, bf, alpha, cfg.sweep_tsize, seed,
+                                  n_keys,
+                                  m.insert_stats.average(),
+                                  m.search_success_stats.average(),
+                                  m.search_fail_stats.average(),
+                                  m.max_cluster,
+                                  m.insert_stats.worst_probes,
+                                  ins_ms,
+                                  m.auxiliary_memory_bytes});
+            progress(++done, total, "  Phase 2");
+          }
+        }
+      }
+    }
+
+    const std::string param_csv = cfg.output_dir + "/benchmark_params.csv";
+    write_param_csv(param_csv, param_rows);
+    std::cout << "  Saved: " << param_csv << "  (" << param_rows.size() << " rows)\n";
+  }
+
+  std::cout << "\nAll done.  Run  python scripts/plot_results.py  to generate plots.\n";
   return 0;
 }
